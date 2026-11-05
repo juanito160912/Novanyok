@@ -82,6 +82,15 @@ jobs:
         working-directory: app
         run: flutter build apk --release
 
+      - name: Mostrar huella de la firma (para revisar Google)
+        if: always()
+        run: |
+          echo "--- Huella de la llave fija ---"
+          keytool -list -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey | grep -E "SHA1|SHA256" || true
+          echo "--- Huella del APK compilado ---"
+          APKSIGNER=$(ls -d $ANDROID_HOME/build-tools/*/apksigner 2>/dev/null | tail -1)
+          if [ -n "$APKSIGNER" ]; then "$APKSIGNER" verify --print-certs app/build/app/outputs/flutter-apk/app-release.apk | grep -E "SHA-1|SHA-256" || true; fi
+
       - name: Subir APK
         uses: actions/upload-artifact@v4
         with:
