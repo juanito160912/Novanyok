@@ -31,7 +31,7 @@ jobs:
 
       - name: Instalar dependencias
         working-directory: app
-        run: flutter pub add flutter_blue_plus:^1.32.0 permission_handler:^11.3.1 http shared_preferences
+        run: flutter pub add flutter_blue_plus:^1.32.0 permission_handler:^11.3.1 http shared_preferences google_sign_in:^6.2.1
 
       - name: Agregar logo e ícono de la app
         working-directory: app
@@ -72,6 +72,11 @@ jobs:
           s = s.replace('android:label="novanyok_app"', 'android:label="Novanyok"')
           open(p, 'w', encoding='utf-8').write(s)
           EOF
+
+      - name: Usar la firma fija del proyecto (necesaria para Google)
+        run: |
+          mkdir -p ~/.android
+          cp debug.keystore ~/.android/debug.keystore
 
       - name: Compilar APK
         working-directory: app
