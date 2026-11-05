@@ -1,16 +1,30 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-import 'package:permission_handler/permission_handler.dart';
+import 'package:google_sign_in/google_sign_in.dart';
 import 'package:http/http.dart' as http;
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 // ======================== CONFIGURACIÓN DE FIREBASE ========================
 // Clave web de tu proyecto "basesita-bonita" (Firebase Authentication).
 const String firebaseApiKey = 'AIzaSyC_dsW7kglbQRF4Ar1MkFtvah7Rn6_EDJ4';
+
+// ID de cliente WEB de Google (Firebase -> Authentication -> Método de acceso
+// -> Google -> "Configuración del SDK web" -> ID de cliente web).
+// Termina en ".apps.googleusercontent.com".
+const String googleWebClientId =
+    '90586077269-hto53s4mco6qaijbfqen317h30mpdojd.apps.googleusercontent.com';
 // ===========================================================================
+
+// Duración del movimiento. DEBEN coincidir con DURACION_SALIR_MS y
+// DURACION_ENTRAR_MS del sketch del ESP32 (solo se usan para la barra animada).
+const int segundosSalir = 5;
+const int segundosEntrar = 5;
 
 // Mismos UUID que el sketch del ESP32-C3
 const String serviceUuid = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -22,7 +36,10 @@ const Color naranja = Color(0xFFEE8029);
 const Color crema = Color(0xFFFCEFAB);
 const Color azul = Color(0xFF2E6EB8);
 const Color rojo = Color(0xFFD62F2F);
+const Color verdeClaro = Color(0xFFCFF2D2);
+const Color verdeOscuro = Color(0xFF1E7A34);
 
+// ============================ SESIÓN / CUENTAS ============================
 class ErrorAuth implements Exception {
   final String codigo;
   ErrorAuth(this.codigo);
@@ -33,11 +50,13 @@ class SesionUsuario {
   final String email;
   final String nombre;
   final String refreshToken;
+  final bool invitado; // invitado = sin cuenta, funciona sin internet
   const SesionUsuario({
     required this.uid,
     required this.email,
     required this.nombre,
     required this.refreshToken,
+    this.invitado = false,
   });
 }
 
@@ -75,20 +94,24 @@ class AuthServicio {
       await p.setString('email', s.email);
       await p.setString('nombre', s.nombre);
       await p.setString('refreshToken', s.refreshToken);
+      await p.setBool('invitado', s.invitado);
     } catch (_) {}
   }
 
+  // Funciona sin internet: solo lee lo guardado en el celular
   static Future<void> cargarGuardada() async {
     try {
       final p = await SharedPreferences.getInstance();
-      final token = p.getString('refreshToken');
       final uid = p.getString('uid');
-      if (token == null || uid == null) return;
+      final token = p.getString('refreshToken') ?? '';
+      final invitado = p.getBool('invitado') ?? false;
+      if (uid == null || (!invitado && token.isEmpty)) return;
       sesion.value = SesionUsuario(
         uid: uid,
         email: p.getString('email') ?? '',
         nombre: p.getString('nombre') ?? '',
         refreshToken: token,
+        invitado: invitado,
       );
     } catch (_) {
       return;
@@ -96,10 +119,10 @@ class AuthServicio {
     unawaited(_validar());
   }
 
-  // Comprueba en segundo plano que la cuenta siga existiendo
+  // Comprueba en segundo plano que la cuenta siga existiendo (si hay internet)
   static Future<void> _validar() async {
     final s = sesion.value;
-    if (s == null) return;
+    if (s == null || s.invitado) return;
     try {
       await _post(
         'https://securetoken.googleapis.com/v1/token?key=$firebaseApiKey',
@@ -154,16 +177,44 @@ class AuthServicio {
     ));
   }
 
-  static Future<void> invitado() async {
+  // Iniciar sesión o registrarse con Google (es lo mismo: si no existe, se crea)
+  static Future<void> google() async {
+    final gs = GoogleSignIn(scopes: ['email'], serverClientId: googleWebClientId);
+    try {
+      await gs.signOut(); // para que siempre muestre la lista de cuentas
+    } catch (_) {}
+    final cuenta = await gs.signIn();
+    if (cuenta == null) throw ErrorAuth('CANCELADO');
+    final autenticacion = await cuenta.authentication;
+    final idToken = autenticacion.idToken;
+    if (idToken == null) throw ErrorAuth('SIN_ID_TOKEN');
+
     final r = await _post(
-      '$_cuentas:signUp?key=$firebaseApiKey',
-      json: {'returnSecureToken': true},
+      '$_cuentas:signInWithIdp?key=$firebaseApiKey',
+      json: {
+        'postBody': 'id_token=$idToken&providerId=google.com',
+        'requestUri': 'http://localhost',
+        'returnIdpCredential': true,
+        'returnSecureToken': true,
+      },
     );
     await _guardar(SesionUsuario(
       uid: r['localId'] as String,
+      email: (r['email'] ?? cuenta.email) as String,
+      nombre: (r['displayName'] ?? r['fullName'] ?? cuenta.displayName ?? '')
+          as String,
+      refreshToken: r['refreshToken'] as String,
+    ));
+  }
+
+  // Modo invitado: NO usa internet, todo queda en el celular
+  static Future<void> invitado() async {
+    await _guardar(const SesionUsuario(
+      uid: 'invitado-local',
       email: '',
       nombre: 'Invitado',
-      refreshToken: r['refreshToken'] as String,
+      refreshToken: '',
+      invitado: true,
     ));
   }
 
@@ -177,8 +228,11 @@ class AuthServicio {
   static Future<void> cerrar() async {
     sesion.value = null;
     try {
+      await GoogleSignIn().signOut();
+    } catch (_) {}
+    try {
       final p = await SharedPreferences.getInstance();
-      for (final k in ['uid', 'email', 'nombre', 'refreshToken']) {
+      for (final k in ['uid', 'email', 'nombre', 'refreshToken', 'invitado']) {
         await p.remove(k);
       }
     } catch (_) {}
@@ -209,7 +263,7 @@ class NovanyokApp extends StatelessWidget {
   }
 }
 
-// Muestra el acceso o el control según haya sesión iniciada
+// Muestra el acceso o el control según haya sesión, con una transición suave
 class PuertaAcceso extends StatelessWidget {
   const PuertaAcceso({super.key});
 
@@ -217,15 +271,42 @@ class PuertaAcceso extends StatelessWidget {
   Widget build(BuildContext context) {
     return ValueListenableBuilder<SesionUsuario?>(
       valueListenable: AuthServicio.sesion,
-      builder: (context, sesion, _) =>
-          sesion == null ? const PantallaAcceso() : const PantallaControl(),
+      builder: (context, sesion, _) => AnimatedSwitcher(
+        duration: const Duration(milliseconds: 500),
+        switchInCurve: Curves.easeOutCubic,
+        transitionBuilder: (hijo, animacion) => FadeTransition(
+          opacity: animacion,
+          child: SlideTransition(
+            position: Tween<Offset>(
+              begin: const Offset(0, 0.06),
+              end: Offset.zero,
+            ).animate(animacion),
+            child: hijo,
+          ),
+        ),
+        child: sesion == null
+            ? const PantallaAcceso(key: ValueKey('acceso'))
+            : PantallaControl(key: ValueKey('control-${sesion.uid}')),
+      ),
     );
   }
 }
 
-// Fondo con huellitas, corazones y pelotas, como en el logo
-class FondoPatron extends StatelessWidget {
+// ============================== ANIMACIONES ==============================
+
+// Fondo con huellitas, corazones y pelotas que flotan suavemente
+class FondoPatron extends StatefulWidget {
   const FondoPatron({super.key});
+
+  @override
+  State<FondoPatron> createState() => _FondoPatronState();
+}
+
+class _FondoPatronState extends State<FondoPatron>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c =
+      AnimationController(vsync: this, duration: const Duration(seconds: 7))
+        ..repeat();
 
   static const _iconos = [
     Icons.pets,
@@ -236,46 +317,222 @@ class FondoPatron extends StatelessWidget {
   ];
 
   @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return LayoutBuilder(builder: (context, c) {
-      const paso = 84.0;
-      final cols = (c.maxWidth / paso).ceil() + 1;
-      final filas = (c.maxHeight / paso).ceil() + 1;
-      final hijos = <Widget>[];
-      for (var f = 0; f < filas; f++) {
-        for (var col = 0; col < cols; col++) {
-          final i = f * cols + col;
-          hijos.add(Positioned(
-            left: col * paso + (f.isOdd ? paso / 2 : 0) - 20,
-            top: f * paso - 10,
-            child: Transform.rotate(
-              angle: ((i % 5) - 2) * 0.25,
-              child: Icon(
-                _iconos[i % _iconos.length],
-                size: 34,
-                color: const Color(0x33F28C1A),
-              ),
-            ),
-          ));
-        }
-      }
-      return Stack(children: hijos);
-    });
+    return RepaintBoundary(
+      child: LayoutBuilder(builder: (context, c) {
+        const paso = 92.0;
+        final cols = (c.maxWidth / paso).ceil() + 1;
+        final filas = (c.maxHeight / paso).ceil() + 1;
+
+        return AnimatedBuilder(
+          animation: _c,
+          builder: (context, _) {
+            final t = _c.value * 2 * math.pi;
+            final hijos = <Widget>[];
+            for (var f = 0; f < filas; f++) {
+              for (var col = 0; col < cols; col++) {
+                final i = f * cols + col;
+                final fase = i * 0.9;
+                hijos.add(Positioned(
+                  left: col * paso + (f.isOdd ? paso / 2 : 0) - 20,
+                  top: f * paso - 10 + 7 * math.sin(t + fase),
+                  child: Transform.rotate(
+                    angle: ((i % 5) - 2) * 0.25 + 0.14 * math.sin(t + fase * 1.3),
+                    child: Icon(
+                      _iconos[i % _iconos.length],
+                      size: 34,
+                      color: const Color(0x33F28C1A),
+                    ),
+                  ),
+                ));
+              }
+            }
+            return Stack(children: hijos);
+          },
+        );
+      }),
+    );
   }
 }
 
-Widget logoCircular(double tamano) {
-  return Container(
-    width: tamano,
-    height: tamano,
-    decoration: const BoxDecoration(
-      shape: BoxShape.circle,
-      boxShadow: [
-        BoxShadow(color: Color(0x40000000), blurRadius: 18, offset: Offset(0, 8)),
-      ],
-    ),
-    child: ClipOval(child: Image.asset('assets/logo.png', fit: BoxFit.cover)),
-  );
+// Aparece con desvanecimiento y deslizamiento hacia arriba
+class Aparece extends StatefulWidget {
+  final Widget child;
+  final int retardoMs;
+  const Aparece({super.key, required this.child, this.retardoMs = 0});
+
+  @override
+  State<Aparece> createState() => _ApareceState();
+}
+
+class _ApareceState extends State<Aparece> with SingleTickerProviderStateMixin {
+  late final AnimationController _c =
+      AnimationController(vsync: this, duration: const Duration(milliseconds: 650));
+  late final Animation<double> _opacidad =
+      CurvedAnimation(parent: _c, curve: Curves.easeOut);
+  late final Animation<Offset> _posicion = Tween<Offset>(
+    begin: const Offset(0, 0.22),
+    end: Offset.zero,
+  ).animate(CurvedAnimation(parent: _c, curve: Curves.easeOutCubic));
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer(Duration(milliseconds: widget.retardoMs), () {
+      if (mounted) _c.forward();
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: _opacidad,
+      child: SlideTransition(position: _posicion, child: widget.child),
+    );
+  }
+}
+
+// Se encoge un poquito al tocarlo
+class Pulsable extends StatefulWidget {
+  final Widget child;
+  final bool activo;
+  const Pulsable({super.key, required this.child, this.activo = true});
+
+  @override
+  State<Pulsable> createState() => _PulsableState();
+}
+
+class _PulsableState extends State<Pulsable> {
+  bool _abajo = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Listener(
+      onPointerDown: (_) => setState(() => _abajo = widget.activo),
+      onPointerUp: (_) => setState(() => _abajo = false),
+      onPointerCancel: (_) => setState(() => _abajo = false),
+      child: AnimatedScale(
+        scale: _abajo ? 0.95 : 1.0,
+        duration: const Duration(milliseconds: 120),
+        curve: Curves.easeOut,
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+// Late (crece y se encoge) mientras esté activo
+class Pulsante extends StatefulWidget {
+  final bool activo;
+  final Widget child;
+  const Pulsante({super.key, required this.activo, required this.child});
+
+  @override
+  State<Pulsante> createState() => _PulsanteState();
+}
+
+class _PulsanteState extends State<Pulsante> with SingleTickerProviderStateMixin {
+  late final AnimationController _c =
+      AnimationController(vsync: this, duration: const Duration(milliseconds: 700));
+  late final Animation<double> _escala = Tween<double>(begin: 1.0, end: 1.2)
+      .animate(CurvedAnimation(parent: _c, curve: Curves.easeInOut));
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.activo) _c.repeat(reverse: true);
+  }
+
+  @override
+  void didUpdateWidget(covariant Pulsante anterior) {
+    super.didUpdateWidget(anterior);
+    if (widget.activo && !_c.isAnimating) {
+      _c.repeat(reverse: true);
+    } else if (!widget.activo && _c.isAnimating) {
+      _c.animateTo(0, duration: const Duration(milliseconds: 200));
+    }
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ScaleTransition(scale: _escala, child: widget.child);
+  }
+}
+
+// Logo que entra con rebote y luego flota suavemente
+class LogoAnimado extends StatefulWidget {
+  final double tamano;
+  const LogoAnimado({super.key, required this.tamano});
+
+  @override
+  State<LogoAnimado> createState() => _LogoAnimadoState();
+}
+
+class _LogoAnimadoState extends State<LogoAnimado> with TickerProviderStateMixin {
+  late final AnimationController _entrada =
+      AnimationController(vsync: this, duration: const Duration(milliseconds: 1100))
+        ..forward();
+  late final AnimationController _flota =
+      AnimationController(vsync: this, duration: const Duration(milliseconds: 2600))
+        ..repeat(reverse: true);
+  late final Animation<double> _escala =
+      CurvedAnimation(parent: _entrada, curve: Curves.elasticOut);
+
+  @override
+  void dispose() {
+    _entrada.dispose();
+    _flota.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ScaleTransition(
+      scale: _escala,
+      child: AnimatedBuilder(
+        animation: _flota,
+        builder: (context, hijo) {
+          final v = Curves.easeInOut.transform(_flota.value) - 0.5;
+          return Transform.translate(
+            offset: Offset(0, v * 12),
+            child: Transform.rotate(angle: v * 0.05, child: hijo),
+          );
+        },
+        child: Container(
+          width: widget.tamano,
+          height: widget.tamano,
+          decoration: const BoxDecoration(
+            shape: BoxShape.circle,
+            boxShadow: [
+              BoxShadow(
+                  color: Color(0x40000000), blurRadius: 18, offset: Offset(0, 8)),
+            ],
+          ),
+          child: ClipOval(child: Image.asset('assets/logo.png', fit: BoxFit.cover)),
+        ),
+      ),
+    );
+  }
 }
 
 // ============================ REGISTRO / LOGIN ============================
@@ -286,11 +543,15 @@ class PantallaAcceso extends StatefulWidget {
   State<PantallaAcceso> createState() => _PantallaAccesoState();
 }
 
-class _PantallaAccesoState extends State<PantallaAcceso> {
+class _PantallaAccesoState extends State<PantallaAcceso>
+    with SingleTickerProviderStateMixin {
   final _nombre = TextEditingController();
   final _correo = TextEditingController();
   final _clave = TextEditingController();
   final _clave2 = TextEditingController();
+
+  late final AnimationController _sacudir =
+      AnimationController(vsync: this, duration: const Duration(milliseconds: 450));
 
   bool _registro = false;
   bool _ocultar = true;
@@ -304,7 +565,17 @@ class _PantallaAccesoState extends State<PantallaAcceso> {
     _correo.dispose();
     _clave.dispose();
     _clave2.dispose();
+    _sacudir.dispose();
     super.dispose();
+  }
+
+  void _fallo(String mensaje) {
+    if (!mounted) return;
+    setState(() {
+      _error = mensaje;
+      _info = null;
+    });
+    _sacudir.forward(from: 0);
   }
 
   String? _validar() {
@@ -338,18 +609,29 @@ class _PantallaAccesoState extends State<PantallaAcceso> {
     }
     if (c.contains('USER_DISABLED')) return 'Esta cuenta está deshabilitada';
     if (c.contains('OPERATION_NOT_ALLOWED')) {
-      return 'El registro con correo no está activado en Firebase';
+      return 'Ese método no está activado en Firebase';
+    }
+    if (c.contains('INVALID_IDP_RESPONSE') || c.contains('SIN_ID_TOKEN')) {
+      return 'Google no devolvió la identificación. Revisa el ID de cliente web';
     }
     return 'Error: $c';
+  }
+
+  String _traducirGoogle(PlatformException e) {
+    final m = '${e.code} ${e.message}'.toLowerCase();
+    if (m.contains('network')) {
+      return 'Sin internet. Puedes usar el modo invitado.';
+    }
+    if (m.contains('apiexception: 10') || m.contains('developer_error')) {
+      return 'Google no está bien configurado (revisa la huella SHA-1 en Firebase)';
+    }
+    return 'Error de Google: ${e.code}';
   }
 
   Future<void> _recuperar() async {
     final correo = _correo.text.trim();
     if (!correo.contains('@') || !correo.contains('.')) {
-      setState(() {
-        _error = 'Escribe tu correo arriba para enviarte el enlace';
-        _info = null;
-      });
+      _fallo('Escribe tu correo arriba para enviarte el enlace');
       return;
     }
     setState(() {
@@ -364,50 +646,48 @@ class _PantallaAccesoState extends State<PantallaAcceso> {
             'Te enviamos un enlace a $correo para crear una contraseña nueva.');
       }
     } on ErrorAuth catch (e) {
-      if (mounted) {
-        setState(() => _error = e.codigo.contains('EMAIL_NOT_FOUND')
-            ? 'Ese correo no está registrado'
-            : _traducir(e.codigo));
-      }
+      _fallo(e.codigo.contains('EMAIL_NOT_FOUND')
+          ? 'Ese correo no está registrado'
+          : _traducir(e.codigo));
     } catch (_) {
-      if (mounted) {
-        setState(() => _error = 'No se pudo conectar. Revisa tu internet.');
-      }
+      _fallo('No se pudo conectar. Revisa tu internet.');
     } finally {
       if (mounted) setState(() => _cargando = false);
     }
   }
 
-  Future<void> _entrarInvitado() async {
+  Future<void> _google() async {
+    if (googleWebClientId.contains('TU_ID')) {
+      _fallo('Falta pegar el ID de cliente web de Google en main.dart');
+      return;
+    }
     setState(() {
       _cargando = true;
       _error = null;
       _info = null;
     });
     try {
-      await AuthServicio.invitado();
+      await AuthServicio.google();
     } on ErrorAuth catch (e) {
-      if (mounted) {
-        setState(() => _error = e.codigo.contains('OPERATION_NOT_ALLOWED')
-            ? 'El acceso anónimo no está activado en Firebase'
-            : _traducir(e.codigo));
-      }
+      if (e.codigo != 'CANCELADO') _fallo(_traducir(e.codigo));
+    } on PlatformException catch (e) {
+      _fallo(_traducirGoogle(e));
     } catch (_) {
-      if (mounted) {
-        setState(() => _error = 'No se pudo conectar. Revisa tu internet.');
-      }
+      _fallo('No se pudo conectar. Revisa tu internet.');
     } finally {
       if (mounted) setState(() => _cargando = false);
     }
   }
 
+  // Modo invitado: no necesita internet
+  Future<void> _entrarInvitado() async {
+    await AuthServicio.invitado();
+  }
+
   Future<void> _enviar() async {
     final problema = _validar();
     if (problema != null) {
-      setState(() {
-        _error = problema;
-        _info = null;
-      });
+      _fallo(problema);
       return;
     }
 
@@ -425,9 +705,9 @@ class _PantallaAccesoState extends State<PantallaAcceso> {
         await AuthServicio.iniciar(correo, _clave.text);
       }
     } on ErrorAuth catch (e) {
-      if (mounted) setState(() => _error = _traducir(e.codigo));
+      _fallo(_traducir(e.codigo));
     } catch (_) {
-      if (mounted) setState(() => _error = 'No se pudo conectar. Revisa tu internet.');
+      _fallo('No se pudo conectar. Revisa tu internet o usa el modo invitado.');
     } finally {
       if (mounted) setState(() => _cargando = false);
     }
@@ -468,8 +748,161 @@ class _PantallaAccesoState extends State<PantallaAcceso> {
     );
   }
 
+  // Muestra u oculta un bloque con animación de tamaño y desvanecimiento
+  Widget _seccion(bool visible, Widget hijo) {
+    return AnimatedCrossFade(
+      firstChild: const SizedBox(width: double.infinity),
+      secondChild: hijo,
+      crossFadeState:
+          visible ? CrossFadeState.showSecond : CrossFadeState.showFirst,
+      duration: const Duration(milliseconds: 320),
+      sizeCurve: Curves.easeOutCubic,
+    );
+  }
+
+  Widget _mensaje() {
+    final texto = _error ?? _info;
+    return AnimatedSize(
+      duration: const Duration(milliseconds: 280),
+      curve: Curves.easeOutCubic,
+      alignment: Alignment.topCenter,
+      child: texto == null
+          ? const SizedBox(width: double.infinity)
+          : Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Text(
+                texto,
+                key: ValueKey(texto),
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: _error != null ? rojo : azul,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+    );
+  }
+
+  Widget _tarjeta() {
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: crema,
+        borderRadius: BorderRadius.circular(26),
+        boxShadow: const [
+          BoxShadow(color: Color(0x26000000), blurRadius: 14, offset: Offset(0, 6)),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 250),
+            child: Text(
+              _registro ? 'Crea tu cuenta' : 'Inicia sesión',
+              key: ValueKey(_registro),
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: azul,
+                fontSize: 24,
+                fontWeight: FontWeight.w900,
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          _seccion(_registro, _campo(_nombre, 'Nombre', Icons.person)),
+          _campo(_correo, 'Correo electrónico', Icons.email,
+              tipo: TextInputType.emailAddress),
+          _campo(_clave, 'Contraseña', Icons.lock, clave: true),
+          _seccion(_registro,
+              _campo(_clave2, 'Repite la contraseña', Icons.lock_outline, clave: true)),
+          _mensaje(),
+          Pulsable(
+            activo: !_cargando,
+            child: FilledButton(
+              onPressed: _cargando ? null : _enviar,
+              style: FilledButton.styleFrom(
+                minimumSize: const Size.fromHeight(56),
+                backgroundColor: azul,
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(28)),
+              ),
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 200),
+                child: _cargando
+                    ? const SizedBox(
+                        key: ValueKey('cargando'),
+                        width: 24,
+                        height: 24,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 3, color: Colors.white),
+                      )
+                    : Text(
+                        _registro ? 'REGISTRARME' : 'ENTRAR',
+                        key: ValueKey(_registro),
+                        style: const TextStyle(
+                            fontSize: 17,
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 1.2),
+                      ),
+              ),
+            ),
+          ),
+          _seccion(
+            !_registro,
+            TextButton(
+              onPressed: _cargando ? null : _recuperar,
+              child: const Text(
+                '¿Olvidaste tu contraseña?',
+                style: TextStyle(color: azul, fontWeight: FontWeight.w700),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _botonGoogle() {
+    return Pulsable(
+      activo: !_cargando,
+      child: FilledButton(
+        onPressed: _cargando ? null : _google,
+        style: FilledButton.styleFrom(
+          minimumSize: const Size.fromHeight(56),
+          backgroundColor: Colors.white,
+          foregroundColor: const Color(0xFF3C4043),
+          disabledBackgroundColor: const Color(0x66FFFFFF),
+          elevation: 2,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Text(
+              'G',
+              style: TextStyle(
+                fontSize: 26,
+                fontWeight: FontWeight.w900,
+                color: Color(0xFF4285F4),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Text(
+              _registro ? 'Registrarme con Google' : 'Continuar con Google',
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    const sombra = [Shadow(color: Color(0x55000000), blurRadius: 4)];
+
     return Scaffold(
       body: Stack(
         children: [
@@ -478,124 +911,67 @@ class _PantallaAccesoState extends State<PantallaAcceso> {
             child: ListView(
               padding: const EdgeInsets.fromLTRB(22, 20, 22, 28),
               children: [
-                Center(child: logoCircular(170)),
+                Center(child: LogoAnimado(tamano: 170)),
                 const SizedBox(height: 18),
-                Container(
-                  padding: const EdgeInsets.all(20),
-                  decoration: BoxDecoration(
-                    color: crema,
-                    borderRadius: BorderRadius.circular(26),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Text(
-                        _registro ? 'Crea tu cuenta' : 'Inicia sesión',
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          color: azul,
-                          fontSize: 24,
-                          fontWeight: FontWeight.w900,
-                        ),
+                Aparece(
+                  retardoMs: 250,
+                  child: AnimatedBuilder(
+                    animation: _sacudir,
+                    builder: (context, hijo) => Transform.translate(
+                      offset: Offset(
+                        math.sin(_sacudir.value * math.pi * 6) *
+                            (1 - _sacudir.value) *
+                            10,
+                        0,
                       ),
-                      const SizedBox(height: 16),
-                      if (_registro)
-                        _campo(_nombre, 'Nombre', Icons.person),
-                      _campo(_correo, 'Correo electrónico', Icons.email,
-                          tipo: TextInputType.emailAddress),
-                      _campo(_clave, 'Contraseña', Icons.lock, clave: true),
-                      if (_registro)
-                        _campo(_clave2, 'Repite la contraseña', Icons.lock_outline,
-                            clave: true),
-                      if (_error != null)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 10),
-                          child: Text(
-                            _error!,
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(
-                                color: rojo, fontWeight: FontWeight.w700),
-                          ),
-                        ),
-                      if (_info != null)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 10),
-                          child: Text(
-                            _info!,
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(
-                                color: azul, fontWeight: FontWeight.w700),
-                          ),
-                        ),
-                      FilledButton(
-                        onPressed: _cargando ? null : _enviar,
-                        style: FilledButton.styleFrom(
-                          minimumSize: const Size.fromHeight(56),
-                          backgroundColor: azul,
-                          foregroundColor: Colors.white,
-                          shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(28)),
-                        ),
-                        child: _cargando
-                            ? const SizedBox(
-                                width: 24,
-                                height: 24,
-                                child: CircularProgressIndicator(
-                                    strokeWidth: 3, color: Colors.white),
-                              )
-                            : Text(
-                                _registro ? 'REGISTRARME' : 'ENTRAR',
-                                style: const TextStyle(
-                                    fontSize: 17,
-                                    fontWeight: FontWeight.w900,
-                                    letterSpacing: 1.2),
-                              ),
-                      ),
-                      if (!_registro)
-                        TextButton(
-                          onPressed: _cargando ? null : _recuperar,
-                          child: const Text(
-                            '¿Olvidaste tu contraseña?',
-                            style: TextStyle(
-                                color: azul, fontWeight: FontWeight.w700),
-                          ),
-                        ),
-                    ],
+                      child: hijo,
+                    ),
+                    child: _tarjeta(),
                   ),
                 ),
                 const SizedBox(height: 14),
-                TextButton(
-                  onPressed: _cargando
-                      ? null
-                      : () => setState(() {
-                            _registro = !_registro;
-                            _error = null;
-                            _info = null;
-                          }),
-                  child: Text(
-                    _registro
-                        ? '¿Ya tienes cuenta? Inicia sesión'
-                        : '¿No tienes cuenta? Regístrate',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 16,
-                      fontWeight: FontWeight.w800,
-                      shadows: [Shadow(color: Color(0x55000000), blurRadius: 4)],
-                    ),
-                  ),
-                ),
-                TextButton(
-                  onPressed: _cargando ? null : _entrarInvitado,
-                  child: const Text(
-                    'Continuar como invitado',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 15,
-                      fontWeight: FontWeight.w700,
-                      decoration: TextDecoration.underline,
-                      decorationColor: Colors.white,
-                      shadows: [Shadow(color: Color(0x55000000), blurRadius: 4)],
-                    ),
+                Aparece(retardoMs: 400, child: _botonGoogle()),
+                const SizedBox(height: 8),
+                Aparece(
+                  retardoMs: 520,
+                  child: Column(
+                    children: [
+                      TextButton(
+                        onPressed: _cargando
+                            ? null
+                            : () => setState(() {
+                                  _registro = !_registro;
+                                  _error = null;
+                                  _info = null;
+                                }),
+                        child: Text(
+                          _registro
+                              ? '¿Ya tienes cuenta? Inicia sesión'
+                              : '¿No tienes cuenta? Regístrate',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w800,
+                            shadows: sombra,
+                          ),
+                        ),
+                      ),
+                      TextButton.icon(
+                        onPressed: _cargando ? null : _entrarInvitado,
+                        icon: const Icon(Icons.cloud_off, color: Colors.white),
+                        label: const Text(
+                          'Continuar como invitado (sin internet)',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700,
+                            decoration: TextDecoration.underline,
+                            decorationColor: Colors.white,
+                            shadows: sombra,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ],
@@ -615,7 +991,8 @@ class PantallaControl extends StatefulWidget {
   State<PantallaControl> createState() => _PantallaControlState();
 }
 
-class _PantallaControlState extends State<PantallaControl> {
+class _PantallaControlState extends State<PantallaControl>
+    with TickerProviderStateMixin {
   BluetoothDevice? _dispositivo;
   BluetoothCharacteristic? _car;
   StreamSubscription<BluetoothConnectionState>? _connSub;
@@ -623,12 +1000,45 @@ class _PantallaControlState extends State<PantallaControl> {
   String _estado = 'Desconectado';
   bool _buscando = false;
 
+  // Barra animada que acompaña el movimiento del collar
+  late final AnimationController _accionCtrl = AnimationController(vsync: this);
+  String? _accion; // 'SALIR' o 'ENTRAR' mientras se mueve
+
+  // Brillo que respira alrededor del botón PARAR
+  late final AnimationController _pulso =
+      AnimationController(vsync: this, duration: const Duration(milliseconds: 1100))
+        ..repeat(reverse: true);
+
   bool get _conectado => _car != null;
 
+  SesionUsuario? get _usuario => AuthServicio.sesion.value;
+
   String get _nombreUsuario {
-    final u = AuthServicio.sesion.value;
+    final u = _usuario;
     if (u == null) return '';
     return u.nombre.isNotEmpty ? u.nombre : u.email;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _accionCtrl.addStatusListener((s) {
+      if (s == AnimationStatus.completed && mounted) {
+        setState(() => _accion = null);
+      }
+    });
+  }
+
+  void _iniciarAccion(String comando) {
+    final seg = comando == 'SALIR' ? segundosSalir : segundosEntrar;
+    setState(() => _accion = comando);
+    _accionCtrl.duration = Duration(seconds: seg);
+    _accionCtrl.forward(from: 0);
+  }
+
+  void _pararAccion() {
+    _accionCtrl.stop();
+    if (mounted) setState(() => _accion = null);
   }
 
   Future<void> _conectar() async {
@@ -683,6 +1093,7 @@ class _PantallaControlState extends State<PantallaControl> {
       _connSub?.cancel();
       _connSub = dev.connectionState.listen((s) {
         if (s == BluetoothConnectionState.disconnected && mounted) {
+          _pararAccion();
           setState(() {
             _car = null;
             _estado = 'Desconectado';
@@ -720,6 +1131,7 @@ class _PantallaControlState extends State<PantallaControl> {
   }
 
   Future<void> _desconectar() async {
+    _pararAccion();
     await _enviar('PARAR', confiable: true);
     await _dispositivo?.disconnect();
   }
@@ -740,10 +1152,22 @@ class _PantallaControlState extends State<PantallaControl> {
     }
   }
 
+  Future<void> _mover(String comando) async {
+    _iniciarAccion(comando);
+    await _enviar(comando);
+  }
+
+  Future<void> _parar() async {
+    _pararAccion();
+    await _enviar('PARAR', confiable: true);
+  }
+
   @override
   void dispose() {
     _connSub?.cancel();
     _dispositivo?.disconnect();
+    _accionCtrl.dispose();
+    _pulso.dispose();
     super.dispose();
   }
 
@@ -755,32 +1179,92 @@ class _PantallaControlState extends State<PantallaControl> {
     required double tamano,
     required VoidCallback? onPressed,
   }) {
-    return FilledButton(
-      onPressed: onPressed,
-      style: FilledButton.styleFrom(
-        minimumSize: Size.fromHeight(alto),
-        backgroundColor: color,
-        foregroundColor: Colors.white,
-        disabledBackgroundColor: const Color(0x66FFFFFF),
-        disabledForegroundColor: Colors.white70,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
-        elevation: 3,
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(icono, size: tamano + 6),
-          const SizedBox(width: 12),
-          Text(
-            texto,
-            style: TextStyle(
-              fontSize: tamano,
-              fontWeight: FontWeight.w900,
-              letterSpacing: 1.5,
+    return Pulsable(
+      activo: onPressed != null,
+      child: FilledButton(
+        onPressed: onPressed,
+        style: FilledButton.styleFrom(
+          minimumSize: Size.fromHeight(alto),
+          backgroundColor: color,
+          foregroundColor: Colors.white,
+          disabledBackgroundColor: const Color(0x66FFFFFF),
+          disabledForegroundColor: Colors.white70,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+          elevation: 3,
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icono, size: tamano + 6),
+            const SizedBox(width: 12),
+            Text(
+              texto,
+              style: TextStyle(
+                fontSize: tamano,
+                fontWeight: FontWeight.w900,
+                letterSpacing: 1.5,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
+    );
+  }
+
+  // Barra que se llena (SALIR) o se vacía (ENTRAR) mientras el collar se mueve
+  Widget _barraAccion() {
+    final accion = _accion;
+    return AnimatedSize(
+      duration: const Duration(milliseconds: 320),
+      curve: Curves.easeOutCubic,
+      alignment: Alignment.topCenter,
+      child: accion == null
+          ? const SizedBox(width: double.infinity)
+          : Padding(
+              padding: const EdgeInsets.only(top: 14),
+              child: Container(
+                padding: const EdgeInsets.fromLTRB(18, 14, 18, 16),
+                decoration: BoxDecoration(
+                  color: crema,
+                  borderRadius: BorderRadius.circular(22),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(accion == 'SALIR' ? Icons.expand : Icons.compress,
+                            color: accion == 'SALIR' ? azul : naranja),
+                        const SizedBox(width: 10),
+                        Text(
+                          accion == 'SALIR' ? 'Saliendo…' : 'Entrando…',
+                          style: const TextStyle(
+                            color: azul,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    AnimatedBuilder(
+                      animation: _accionCtrl,
+                      builder: (context, _) => ClipRRect(
+                        borderRadius: BorderRadius.circular(10),
+                        child: LinearProgressIndicator(
+                          value: accion == 'SALIR'
+                              ? _accionCtrl.value
+                              : 1 - _accionCtrl.value,
+                          minHeight: 12,
+                          backgroundColor: Colors.white,
+                          color: accion == 'SALIR' ? azul : naranja,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
     );
   }
 
@@ -789,6 +1273,8 @@ class _PantallaControlState extends State<PantallaControl> {
     final IconData iconoBt = _conectado
         ? Icons.bluetooth_connected
         : (_buscando ? Icons.bluetooth_searching : Icons.bluetooth);
+    final invitado = _usuario?.invitado ?? false;
+    const sombra = [Shadow(color: Color(0x55000000), blurRadius: 4)];
 
     return Scaffold(
       body: Stack(
@@ -798,116 +1284,211 @@ class _PantallaControlState extends State<PantallaControl> {
             child: ListView(
               padding: const EdgeInsets.fromLTRB(22, 8, 22, 28),
               children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        'Hola, $_nombreUsuario',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 18,
-                          fontWeight: FontWeight.w900,
-                          shadows: [
-                            Shadow(color: Color(0x55000000), blurRadius: 4)
+                Aparece(
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Hola, $_nombreUsuario',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 18,
+                                fontWeight: FontWeight.w900,
+                                shadows: sombra,
+                              ),
+                            ),
+                            if (invitado)
+                              const Row(
+                                children: [
+                                  Icon(Icons.cloud_off,
+                                      color: Colors.white, size: 14),
+                                  SizedBox(width: 4),
+                                  Text(
+                                    'Modo invitado · sin internet',
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w700,
+                                      shadows: sombra,
+                                    ),
+                                  ),
+                                ],
+                              ),
                           ],
                         ),
                       ),
-                    ),
-                    IconButton(
-                      tooltip: 'Cerrar sesión',
-                      onPressed: _cerrarSesion,
-                      icon: const Icon(Icons.logout, color: Colors.white),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 4),
-                Center(child: logoCircular(190)),
-                const SizedBox(height: 14),
-                const Text(
-                  'COLLAR ISABELINO RETRÁCTIL',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 14,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 1.6,
-                    shadows: [Shadow(color: Color(0x55000000), blurRadius: 4)],
-                  ),
-                ),
-                const SizedBox(height: 18),
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
-                  decoration: BoxDecoration(
-                    color: crema,
-                    borderRadius: BorderRadius.circular(22),
-                  ),
-                  child: Row(
-                    children: [
-                      Icon(iconoBt, color: azul, size: 26),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Text(
-                          _estado,
-                          style: const TextStyle(
-                            color: azul,
-                            fontSize: 15,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
+                      IconButton(
+                        tooltip: 'Cerrar sesión',
+                        onPressed: _cerrarSesion,
+                        icon: const Icon(Icons.logout, color: Colors.white),
                       ),
                     ],
                   ),
                 ),
-                const SizedBox(height: 12),
-                FilledButton(
-                  onPressed:
-                      _buscando ? null : (_conectado ? _desconectar : _conectar),
-                  style: FilledButton.styleFrom(
-                    minimumSize: const Size.fromHeight(54),
-                    backgroundColor: Colors.white,
-                    foregroundColor: azul,
-                    disabledBackgroundColor: const Color(0x66FFFFFF),
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(28)),
-                  ),
+                const SizedBox(height: 4),
+                Center(child: LogoAnimado(tamano: 190)),
+                const SizedBox(height: 14),
+                const Aparece(
+                  retardoMs: 200,
                   child: Text(
-                    _buscando
-                        ? 'Buscando...'
-                        : (_conectado ? 'Desconectar' : 'Conectar por Bluetooth'),
-                    style: const TextStyle(
-                        fontSize: 16, fontWeight: FontWeight.w800),
+                    'COLLAR ISABELINO RETRÁCTIL',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 1.6,
+                      shadows: sombra,
+                    ),
                   ),
                 ),
-                const SizedBox(height: 26),
-                _boton(
-                  texto: 'SALIR',
-                  icono: Icons.expand,
-                  color: azul,
-                  alto: 84,
-                  tamano: 24,
-                  onPressed: _conectado ? () => _enviar('SALIR') : null,
+                const SizedBox(height: 18),
+                Aparece(
+                  retardoMs: 300,
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 400),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+                    decoration: BoxDecoration(
+                      color: _conectado ? verdeClaro : crema,
+                      borderRadius: BorderRadius.circular(22),
+                    ),
+                    child: Row(
+                      children: [
+                        AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 300),
+                          transitionBuilder: (hijo, anim) => ScaleTransition(
+                            scale: anim,
+                            child: FadeTransition(opacity: anim, child: hijo),
+                          ),
+                          child: Pulsante(
+                            key: ValueKey(iconoBt),
+                            activo: _buscando,
+                            child: Icon(
+                              iconoBt,
+                              color: _conectado ? verdeOscuro : azul,
+                              size: 26,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: AnimatedSwitcher(
+                            duration: const Duration(milliseconds: 300),
+                            layoutBuilder: (actual, anteriores) => Stack(
+                              alignment: Alignment.centerLeft,
+                              children: [
+                                ...anteriores,
+                                if (actual != null) actual,
+                              ],
+                            ),
+                            child: Text(
+                              _estado,
+                              key: ValueKey(_estado),
+                              style: TextStyle(
+                                color: _conectado ? verdeOscuro : azul,
+                                fontSize: 15,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Aparece(
+                  retardoMs: 380,
+                  child: Pulsable(
+                    activo: !_buscando,
+                    child: FilledButton(
+                      onPressed:
+                          _buscando ? null : (_conectado ? _desconectar : _conectar),
+                      style: FilledButton.styleFrom(
+                        minimumSize: const Size.fromHeight(54),
+                        backgroundColor: Colors.white,
+                        foregroundColor: azul,
+                        disabledBackgroundColor: const Color(0x66FFFFFF),
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(28)),
+                      ),
+                      child: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 250),
+                        child: Text(
+                          _buscando
+                              ? 'Buscando...'
+                              : (_conectado
+                                  ? 'Desconectar'
+                                  : 'Conectar por Bluetooth'),
+                          key: ValueKey('$_buscando-$_conectado'),
+                          style: const TextStyle(
+                              fontSize: 16, fontWeight: FontWeight.w800),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                _barraAccion(),
+                const SizedBox(height: 24),
+                Aparece(
+                  retardoMs: 460,
+                  child: _boton(
+                    texto: 'SALIR',
+                    icono: Icons.expand,
+                    color: azul,
+                    alto: 84,
+                    tamano: 24,
+                    onPressed: _conectado ? () => _mover('SALIR') : null,
+                  ),
                 ),
                 const SizedBox(height: 14),
-                _boton(
-                  texto: 'ENTRAR',
-                  icono: Icons.compress,
-                  color: naranja,
-                  alto: 84,
-                  tamano: 24,
-                  onPressed: _conectado ? () => _enviar('ENTRAR') : null,
+                Aparece(
+                  retardoMs: 540,
+                  child: _boton(
+                    texto: 'ENTRAR',
+                    icono: Icons.compress,
+                    color: naranja,
+                    alto: 84,
+                    tamano: 24,
+                    onPressed: _conectado ? () => _mover('ENTRAR') : null,
+                  ),
                 ),
                 const SizedBox(height: 14),
-                _boton(
-                  texto: 'PARAR',
-                  icono: Icons.stop_rounded,
-                  color: rojo,
-                  alto: 104,
-                  tamano: 30,
-                  onPressed:
-                      _conectado ? () => _enviar('PARAR', confiable: true) : null,
+                Aparece(
+                  retardoMs: 620,
+                  child: AnimatedBuilder(
+                    animation: _pulso,
+                    builder: (context, hijo) => Container(
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(28),
+                        boxShadow: _conectado
+                            ? [
+                                BoxShadow(
+                                  color: rojo.withAlpha(
+                                      (255 * (0.15 + 0.35 * _pulso.value)).round()),
+                                  blurRadius: 10 + 18 * _pulso.value,
+                                  spreadRadius: 1 + 4 * _pulso.value,
+                                ),
+                              ]
+                            : const [],
+                      ),
+                      child: hijo,
+                    ),
+                    child: _boton(
+                      texto: 'PARAR',
+                      icono: Icons.stop_rounded,
+                      color: rojo,
+                      alto: 104,
+                      tamano: 30,
+                      onPressed: _conectado ? _parar : null,
+                    ),
+                  ),
                 ),
               ],
             ),
