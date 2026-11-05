@@ -618,14 +618,21 @@ class _PantallaAccesoState extends State<PantallaAcceso>
   }
 
   String _traducirGoogle(PlatformException e) {
-    final m = '${e.code} ${e.message}'.toLowerCase();
-    if (m.contains('network')) {
+    final detalle = '${e.code} ${e.message ?? ''}'.trim();
+    final m = detalle.toLowerCase();
+    if (m.contains('network') || m.contains('apiexception: 7')) {
       return 'Sin internet. Puedes usar el modo invitado.';
     }
     if (m.contains('apiexception: 10') || m.contains('developer_error')) {
-      return 'Google no está bien configurado (revisa la huella SHA-1 en Firebase)';
+      return 'Google no reconoce esta app (revisa la huella SHA-1 y el paquete en Firebase). [$detalle]';
     }
-    return 'Error de Google: ${e.code}';
+    if (m.contains('apiexception: 12500')) {
+      return 'Google rechazó el inicio (revisa el correo de asistencia y la pantalla de consentimiento). [$detalle]';
+    }
+    if (m.contains('apiexception: 16')) {
+      return 'Google canceló el inicio (suele ser la huella SHA-1 o el cliente Android). [$detalle]';
+    }
+    return 'Error de Google: $detalle';
   }
 
   Future<void> _recuperar() async {
