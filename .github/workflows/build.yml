@@ -1,27 +1,26 @@
-
 name: Build APK
- 
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
- 
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
- 
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
- 
+
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
- 
+
       - name: Crear proyecto Flutter y copiar la app
         run: |
           flutter create --org com.novanyok --project-name novanyok_app app
@@ -29,11 +28,11 @@ jobs:
           rm -f app/test/widget_test.dart
           mkdir -p app/assets
           cp logo.png icon.png icon_foreground.png app/assets/
- 
+
       - name: Instalar dependencias
         working-directory: app
-        run: flutter pub add flutter_blue_plus:^1.32.0 permission_handler:^11.3.1
- 
+        run: flutter pub add flutter_blue_plus:^1.32.0 permission_handler:^11.3.1 http shared_preferences
+
       - name: Agregar logo e ícono de la app
         working-directory: app
         run: |
@@ -54,14 +53,15 @@ jobs:
             adaptive_icon_foreground: "assets/icon_foreground.png"
           EOF
           dart run flutter_launcher_icons -f flutter_launcher_icons.yaml
- 
+
       - name: Agregar permisos de Bluetooth
         working-directory: app
         run: |
           python3 - <<'EOF'
           p = 'android/app/src/main/AndroidManifest.xml'
           s = open(p, encoding='utf-8').read()
-          permisos = '''<uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
+          permisos = '''<uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
               <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30"/>
               <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation"/>
               <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
@@ -72,14 +72,13 @@ jobs:
           s = s.replace('android:label="novanyok_app"', 'android:label="Novanyok"')
           open(p, 'w', encoding='utf-8').write(s)
           EOF
- 
+
       - name: Compilar APK
         working-directory: app
         run: flutter build apk --release
- 
+
       - name: Subir APK
         uses: actions/upload-artifact@v4
         with:
           name: apk-novanyok
           path: app/build/app/outputs/flutter-apk/app-release.apk
- 
