@@ -1,3 +1,4 @@
+
 name: Build APK
  
 on:
@@ -26,10 +27,33 @@ jobs:
           flutter create --org com.novanyok --project-name novanyok_app app
           cp lib/main.dart app/lib/main.dart
           rm -f app/test/widget_test.dart
+          mkdir -p app/assets
+          cp logo.png icon.png icon_foreground.png app/assets/
  
       - name: Instalar dependencias
         working-directory: app
         run: flutter pub add flutter_blue_plus:^1.32.0 permission_handler:^11.3.1
+ 
+      - name: Agregar logo e ícono de la app
+        working-directory: app
+        run: |
+          flutter pub add dev:flutter_launcher_icons
+          python3 - <<'EOF'
+          p = 'pubspec.yaml'
+          s = open(p, encoding='utf-8').read()
+          assert 'uses-material-design: true' in s
+          s = s.replace('uses-material-design: true', 'uses-material-design: true\n\n  assets:\n    - assets/', 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          EOF
+          cat > flutter_launcher_icons.yaml <<'EOF'
+          flutter_launcher_icons:
+            android: true
+            ios: false
+            image_path: "assets/icon.png"
+            adaptive_icon_background: "#FFBB1B"
+            adaptive_icon_foreground: "assets/icon_foreground.png"
+          EOF
+          dart run flutter_launcher_icons -f flutter_launcher_icons.yaml
  
       - name: Agregar permisos de Bluetooth
         working-directory: app
@@ -58,3 +82,4 @@ jobs:
         with:
           name: apk-novanyok
           path: app/build/app/outputs/flutter-apk/app-release.apk
+ 
