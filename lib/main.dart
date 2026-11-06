@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'package:audioplayers/audioplayers.dart' as ap;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -23,8 +24,8 @@ const String googleWebClientId =
 
 // Duración del movimiento. DEBEN coincidir con DURACION_SALIR_MS y
 // DURACION_ENTRAR_MS del sketch del ESP32 (solo se usan para la barra animada).
-const int segundosSalir = 5;
-const int segundosEntrar = 5;
+const double segundosSalir = 0.8;
+const double segundosEntrar = 0.8;
 
 // Mismos UUID que el sketch del ESP32-C3
 const String serviceUuid = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -38,6 +39,50 @@ const Color azul = Color(0xFF2E6EB8);
 const Color rojo = Color(0xFFD62F2F);
 const Color verdeClaro = Color(0xFFCFF2D2);
 const Color verdeOscuro = Color(0xFF1E7A34);
+
+// ================================ SONIDOS ================================
+// Sonidos suaves y cortos (assets/sonidos/*.wav). Se pueden silenciar con el
+// botón del altavoz de la pantalla de control; la elección se recuerda.
+class Sonidos {
+  static bool activo = true;
+  static final Map<String, ap.AudioPlayer> _jugadores = {};
+
+  static Future<void> iniciar() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      activo = p.getBool('sonido') ?? true;
+    } catch (_) {}
+    try {
+      // "mixWithOthers": no corta la música ni los audios de otras apps
+      await ap.AudioPlayer.global.setAudioContext(
+        ap.AudioContextConfig(
+          focus: ap.AudioContextConfigFocus.mixWithOthers,
+          stayAwake: false,
+        ).build(),
+      );
+    } catch (_) {}
+  }
+
+  static Future<void> alternar() async {
+    activo = !activo;
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setBool('sonido', activo);
+    } catch (_) {}
+  }
+
+  static Future<void> tocar(String nombre, {double volumen = 0.85}) async {
+    if (!activo) return;
+    try {
+      final j = _jugadores.putIfAbsent(
+        nombre,
+        () => ap.AudioPlayer()..setReleaseMode(ap.ReleaseMode.stop),
+      );
+      await j.stop();
+      await j.play(ap.AssetSource('sonidos/$nombre.wav'), volume: volumen);
+    } catch (_) {}
+  }
+}
 
 // ============================ SESIÓN / CUENTAS ============================
 class ErrorAuth implements Exception {
@@ -242,6 +287,7 @@ class AuthServicio {
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await AuthServicio.cargarGuardada();
+  await Sonidos.iniciar();
   runApp(const NovanyokApp());
 }
 
@@ -576,6 +622,7 @@ class _PantallaAccesoState extends State<PantallaAcceso>
       _info = null;
     });
     _sacudir.forward(from: 0);
+    Sonidos.tocar('error', volumen: 0.7);
   }
 
   String? _validar() {
@@ -1034,12 +1081,13 @@ class _PantallaControlState extends State<PantallaControl>
         setState(() => _accion = null);
       }
     });
+    Sonidos.tocar('entrada');   // sonido de ingreso
   }
 
   void _iniciarAccion(String comando) {
     final seg = comando == 'SALIR' ? segundosSalir : segundosEntrar;
     setState(() => _accion = comando);
-    _accionCtrl.duration = Duration(seconds: seg);
+    _accionCtrl.duration = Duration(milliseconds: (seg * 1000).round());
     _accionCtrl.forward(from: 0);
   }
 
@@ -1101,6 +1149,7 @@ class _PantallaControlState extends State<PantallaControl>
       _connSub = dev.connectionState.listen((s) {
         if (s == BluetoothConnectionState.disconnected && mounted) {
           _pararAccion();
+          Sonidos.tocar('desconectado');
           setState(() {
             _car = null;
             _estado = 'Desconectado';
@@ -1130,6 +1179,7 @@ class _PantallaControlState extends State<PantallaControl>
         _car = car;
         _estado = 'Conectado a ${dev.platformName}';
       });
+      Sonidos.tocar('conectado');
     } catch (e) {
       setState(() => _estado = 'Error: $e');
     } finally {
@@ -1160,11 +1210,15 @@ class _PantallaControlState extends State<PantallaControl>
   }
 
   Future<void> _mover(String comando) async {
+    Sonidos.tocar(comando == 'SALIR' ? 'salir' : 'entrar');
+    HapticFeedback.lightImpact();
     _iniciarAccion(comando);
     await _enviar(comando);
   }
 
   Future<void> _parar() async {
+    Sonidos.tocar('parar', volumen: 1.0);
+    HapticFeedback.mediumImpact();
     _pararAccion();
     await _enviar('PARAR', confiable: true);
   }
@@ -1327,6 +1381,18 @@ class _PantallaControlState extends State<PantallaControl>
                                 ],
                               ),
                           ],
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: Sonidos.activo ? 'Silenciar' : 'Activar sonido',
+                        onPressed: () async {
+                          await Sonidos.alternar();
+                          if (mounted) setState(() {});
+                          if (Sonidos.activo) Sonidos.tocar('conectado', volumen: 0.55);
+                        },
+                        icon: Icon(
+                          Sonidos.activo ? Icons.volume_up : Icons.volume_off,
+                          color: Colors.white,
                         ),
                       ),
                       IconButton(
