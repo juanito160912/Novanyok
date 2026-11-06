@@ -28,10 +28,11 @@ jobs:
           rm -f app/test/widget_test.dart
           mkdir -p app/assets
           cp logo.png icon.png icon_foreground.png app/assets/
+          cp -r sonidos app/assets/sonidos
 
       - name: Instalar dependencias
         working-directory: app
-        run: flutter pub add flutter_blue_plus:^1.32.0 permission_handler:^11.3.1 http shared_preferences google_sign_in:^6.2.1
+        run: flutter pub add flutter_blue_plus:^1.32.0 permission_handler:^11.3.1 http shared_preferences google_sign_in:^6.2.1 audioplayers:6.1.0
 
       - name: Agregar logo e ícono de la app
         working-directory: app
@@ -41,7 +42,7 @@ jobs:
           p = 'pubspec.yaml'
           s = open(p, encoding='utf-8').read()
           assert 'uses-material-design: true' in s
-          s = s.replace('uses-material-design: true', 'uses-material-design: true\n\n  assets:\n    - assets/', 1)
+          s = s.replace('uses-material-design: true', 'uses-material-design: true\n\n  assets:\n    - assets/\n    - assets/sonidos/', 1)
           open(p, 'w', encoding='utf-8').write(s)
           EOF
           cat > flutter_launcher_icons.yaml <<'EOF'
