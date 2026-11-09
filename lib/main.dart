@@ -22,14 +22,16 @@ const String googleWebClientId =
     '90586077269-hto53s4mco6qaijbfqen317h30mpdojd.apps.googleusercontent.com';
 // ===========================================================================
 
-// Duración del movimiento. DEBEN coincidir con DURACION_SALIR_MS y
-// DURACION_ENTRAR_MS del sketch del ESP32 (solo se usan para la barra animada).
-const double segundosSalir = 0.8;
-const double segundosEntrar = 0.8;
+// Duración ESTIMADA del movimiento (solo para animar la barra). El movimiento
+// real termina cuando el ESP32 avisa que tocó el contacto (AFUERA / ADENTRO).
+// Con el sketch v3: (RECORRIDO_MS + MARGEN_MS) / 1000 = (400 + 150) / 1000
+const double segundosSalir = 0.55;
+const double segundosEntrar = 0.55;
 
 // Mismos UUID que el sketch del ESP32-C3
 const String serviceUuid = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-const String charUuid = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+const String charUuid = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // app -> ESP32
+const String charTxUuid = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // ESP32 -> app (estado)
 
 // Colores tomados del logo de Novanyok
 const Color amarillo = Color(0xFFFFBB1B);
@@ -1050,6 +1052,12 @@ class _PantallaControlState extends State<PantallaControl>
   BluetoothDevice? _dispositivo;
   BluetoothCharacteristic? _car;
   StreamSubscription<BluetoothConnectionState>? _connSub;
+  StreamSubscription<List<int>>? _notifSub;
+
+  // Posición real reportada por el ESP32: 'ADENTRO', 'AFUERA', 'MEDIO' o null
+  String? _posicion;
+  // true si el ESP32 tiene finales de carrera (firmware v2 con estado)
+  bool _conFinales = false;
 
   String _estado = 'Desconectado';
   bool _buscando = false;
@@ -1077,7 +1085,8 @@ class _PantallaControlState extends State<PantallaControl>
   void initState() {
     super.initState();
     _accionCtrl.addStatusListener((s) {
-      if (s == AnimationStatus.completed && mounted) {
+      // Con finales de carrera la barra se cierra cuando llega el aviso del ESP32
+      if (s == AnimationStatus.completed && mounted && !_conFinales) {
         setState(() => _accion = null);
       }
     });
@@ -1088,7 +1097,60 @@ class _PantallaControlState extends State<PantallaControl>
     final seg = comando == 'SALIR' ? segundosSalir : segundosEntrar;
     setState(() => _accion = comando);
     _accionCtrl.duration = Duration(milliseconds: (seg * 1000).round());
-    _accionCtrl.forward(from: 0);
+    if (_conFinales) {
+      // avanza hasta el 92 % y espera el aviso real del contacto
+      _accionCtrl.value = 0;
+      _accionCtrl.animateTo(0.92, curve: Curves.easeOut);
+    } else {
+      _accionCtrl.forward(from: 0);
+    }
+  }
+
+  // Completa la barra y la oculta cuando el ESP32 confirma el final
+  void _finalizarAccion() {
+    if (_accion == null) return;
+    _accionCtrl
+        .animateTo(1.0, duration: const Duration(milliseconds: 220))
+        .whenComplete(() {
+      Future.delayed(const Duration(milliseconds: 350), () {
+        if (mounted) setState(() => _accion = null);
+      });
+    });
+  }
+
+  // Mensajes que envía el ESP32 por la característica de estado
+  void _procesarEstado(String msg) {
+    if (!mounted) return;
+    switch (msg) {
+      case 'SALIENDO':
+      case 'ENTRANDO':
+        {
+          final cmd = msg == 'SALIENDO' ? 'SALIR' : 'ENTRAR';
+          if (_accion != cmd) _iniciarAccion(cmd);
+          setState(() => _posicion = 'MEDIO');
+        }
+        break;
+      case 'AFUERA':
+      case 'ADENTRO':
+        setState(() => _posicion = msg);
+        _finalizarAccion();
+        break;
+      case 'MEDIO':
+        _pararAccion();
+        setState(() => _posicion = 'MEDIO');
+        break;
+      case 'ATASCO':
+        _pararAccion();
+        setState(() => _posicion = 'MEDIO');
+        Sonidos.tocar('error');
+        HapticFeedback.heavyImpact();
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text(
+              'El collar no llegó al final. Revisa que nada lo trabe y que los contactos estén limpios.'),
+          duration: Duration(seconds: 4),
+        ));
+        break;
+    }
   }
 
   void _pararAccion() {
@@ -1148,6 +1210,10 @@ class _PantallaControlState extends State<PantallaControl>
       _connSub?.cancel();
       _connSub = dev.connectionState.listen((s) {
         if (s == BluetoothConnectionState.disconnected && mounted) {
+          _notifSub?.cancel();
+          _notifSub = null;
+          _conFinales = false;
+          _posicion = null;
           _pararAccion();
           Sonidos.tocar('desconectado');
           setState(() {
@@ -1159,10 +1225,12 @@ class _PantallaControlState extends State<PantallaControl>
 
       final servicios = await dev.discoverServices();
       BluetoothCharacteristic? car;
+      BluetoothCharacteristic? carTx;
       for (final s in servicios) {
         if (s.uuid == Guid(serviceUuid)) {
           for (final c in s.characteristics) {
             if (c.uuid == Guid(charUuid)) car = c;
+            if (c.uuid == Guid(charTxUuid)) carTx = c;
           }
         }
       }
@@ -1174,11 +1242,28 @@ class _PantallaControlState extends State<PantallaControl>
         return;
       }
 
+      // Estado real del collar (firmware v2). Si no existe, la app funciona
+      // como antes, con la barra por tiempo.
+      _notifSub?.cancel();
+      _conFinales = false;
+      if (carTx != null) {
+        try {
+          _notifSub = carTx.onValueReceived.listen((v) =>
+              _procesarEstado(utf8.decode(v, allowMalformed: true).trim().toUpperCase()));
+          await carTx.setNotifyValue(true);
+          _conFinales = true;
+        } catch (_) {
+          _notifSub?.cancel();
+          _notifSub = null;
+        }
+      }
+
       setState(() {
         _dispositivo = dev;
         _car = car;
         _estado = 'Conectado a ${dev.platformName}';
       });
+      if (_conFinales) await _enviar('ESTADO');
       Sonidos.tocar('conectado');
     } catch (e) {
       setState(() => _estado = 'Error: $e');
@@ -1226,6 +1311,7 @@ class _PantallaControlState extends State<PantallaControl>
   @override
   void dispose() {
     _connSub?.cancel();
+    _notifSub?.cancel();
     _dispositivo?.disconnect();
     _accionCtrl.dispose();
     _pulso.dispose();
@@ -1269,6 +1355,64 @@ class _PantallaControlState extends State<PantallaControl>
           ],
         ),
       ),
+    );
+  }
+
+  // Indicador de la posición real del collar (solo con finales de carrera)
+  Widget _indicadorPosicion() {
+    final p = _posicion;
+    final visible = _conectado && _conFinales && p != null;
+    final String texto;
+    final IconData icono;
+    final Color color;
+    switch (p) {
+      case 'AFUERA':
+        texto = 'Collar afuera';
+        icono = Icons.expand;
+        color = azul;
+        break;
+      case 'ADENTRO':
+        texto = 'Collar adentro';
+        icono = Icons.compress;
+        color = naranja;
+        break;
+      default:
+        texto = 'Collar a medio camino';
+        icono = Icons.more_horiz;
+        color = verdeOscuro;
+    }
+    return AnimatedSize(
+      duration: const Duration(milliseconds: 280),
+      alignment: Alignment.topCenter,
+      child: !visible
+          ? const SizedBox(width: double.infinity)
+          : Padding(
+              padding: const EdgeInsets.only(top: 12),
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 250),
+                child: Container(
+                  key: ValueKey(texto),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(22),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(icono, color: color),
+                      const SizedBox(width: 10),
+                      Text(texto,
+                          style: TextStyle(
+                              color: color,
+                              fontSize: 16,
+                              fontWeight: FontWeight.w800)),
+                    ],
+                  ),
+                ),
+              ),
+            ),
     );
   }
 
@@ -1507,6 +1651,7 @@ class _PantallaControlState extends State<PantallaControl>
                     ),
                   ),
                 ),
+                _indicadorPosicion(),
                 _barraAccion(),
                 const SizedBox(height: 24),
                 Aparece(
@@ -1517,7 +1662,9 @@ class _PantallaControlState extends State<PantallaControl>
                     color: azul,
                     alto: 84,
                     tamano: 24,
-                    onPressed: _conectado ? () => _mover('SALIR') : null,
+                    onPressed: _conectado && _posicion != 'AFUERA'
+                        ? () => _mover('SALIR')
+                        : null,
                   ),
                 ),
                 const SizedBox(height: 14),
@@ -1529,7 +1676,9 @@ class _PantallaControlState extends State<PantallaControl>
                     color: naranja,
                     alto: 84,
                     tamano: 24,
-                    onPressed: _conectado ? () => _mover('ENTRAR') : null,
+                    onPressed: _conectado && _posicion != 'ADENTRO'
+                        ? () => _mover('ENTRAR')
+                        : null,
                   ),
                 ),
                 const SizedBox(height: 14),
