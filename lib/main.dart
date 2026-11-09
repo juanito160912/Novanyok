@@ -24,8 +24,11 @@ const String googleWebClientId =
 
 // Duración ESTIMADA del movimiento (solo para animar la barra). El movimiento
 // real termina cuando el ESP32 avisa que tocó el contacto (AFUERA / ADENTRO).
-// Con el sketch v3: (RECORRIDO_MS + MARGEN_MS) / 1000 = (400 + 150) / 1000
-const double segundosSalir = 0.55;
+// Deben coincidir con el sketch: (RECORRIDO_MS + MARGEN_MS) / 1000
+//   SALIR : (RECORRIDO_SALIR_MS 900 + MARGEN_MS 150) / 1000 = 1.05
+//   ENTRAR: (RECORRIDO_ENTRAR_MS 400 + MARGEN_MS 150) / 1000 = 0.55
+// Si cambias esos tiempos en el sketch, cambia estos dos números.
+const double segundosSalir = 1.05;
 const double segundosEntrar = 0.55;
 
 // Mismos UUID que el sketch del ESP32-C3
